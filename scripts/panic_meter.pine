@@ -1,0 +1,568 @@
+//@version=6
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Igor (github.com/<twoj-login>/market-panic-meter)
+//
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  MARKET PANIC METER · Extreme Fear / Euphoria (S&P 500)            v1.3.1    ║
+// ╠══════════════════════════════════════════════════════════════════════════════╣
+// ║  Pięć wskaźników sentymentu "głosuje", czy na rynku panuje panika:           ║
+// ║    1. VIX                                  > 22.8                            ║
+// ║    2. % spółek S&P 500 powyżej SMA50       (INDEX:S5FI)  < próg              ║
+// ║    3. % spółek S&P 500 powyżej SMA200      (INDEX:S5TH)  < próg              ║
+// ║    4. Put/Call Ratio CBOE (total)          > 1.02                            ║
+// ║    5. Odległość S&P 500 od SMA125 (%)      < próg                            ║
+// ║  EXTREME FEAR = min. 3 potwierdzenia jednocześnie. EUFORIA = progi lustrzane ║
+// ║  Sygnał zawsze liczony z danych DZIENNYCH (tak skalibrowano progi):          ║
+// ║    · intraday  → bieżące odczyty dzienne                                     ║
+// ║    · 1D        → sesja po sesji                                              ║
+// ║    · 1W / 1M   → składnik głosuje, jeśli próg przekroczono w dowolnym dniu   ║
+// ║  Sygnał to stan CAŁEGO RYNKU; na wykresie akcji tabela pokazuje, jak ta      ║
+// ║  akcja zachowywała się po sygnałach rynkowych.                               ║
+// ║  Narzędzie edukacyjne. Nie stanowi rekomendacji inwestycyjnej.              ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+indicator("Market Panic Meter · Extreme Fear / Euphoria [S&P 500]", shorttitle = "PanicMeter", overlay = false, precision = 0, max_bars_back = 1500)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// STAŁE
+// ════════════════════════════════════════════════════════════════════════════════
+const string GRP_SRC   = "① Źródła danych"
+const string GRP_COMP  = "② Składniki (głosowanie)"
+const string GRP_FEAR  = "③ Progi: EXTREME FEAR (panika)"
+const string GRP_EUPH  = "④ Progi: EUFORIA"
+const string GRP_LOGIC = "⑤ Logika sygnału"
+const string GRP_MAIN  = "⑥ Wykres główny"
+const string GRP_PANE  = "⑦ Okno wskaźnika"
+const string GRP_TBL   = "⑧ Panel"
+const string GRP_STAT  = "⑨ Statystyki historyczne (backtest)"
+
+const string BM_SEP = "Osobno: MA50 i MA200 = 2 głosy"
+const string BM_ONE = "Łącznie: 1 głos (oba progi naraz)"
+
+const string M_AVG = "Średnia stopa zwrotu"
+const string M_WIN = "Win rate (zwrot > 0)"
+const string M_HIT = "Hit rate vs średnia"
+const string M_RR  = "Risk/Reward (średnia / odchylenie)"
+const string M_N   = "Liczba obserwacji"
+
+const string P_TL = "Lewy górny"
+const string P_TR = "Prawy górny"
+const string P_BL = "Lewy dolny"
+const string P_BR = "Prawy dolny"
+const string P_BC = "Środek dolny"
+const string P_ML = "Lewy środek"
+const string P_MR = "Prawy środek"
+
+const string W_MAIN = "Wykres główny"
+const string W_PANE = "Okno wskaźnika"
+
+const string MS_BG    = "Pełne tło"
+const string MS_NONE  = "Brak"
+
+const string HS_BAND = "Pasmo (schodkowe)"
+const string HS_COL  = "Słupki"
+
+const string RET_CHART = "Symbol wykresu"
+const string RET_IDX   = "Indeks bazowy"
+
+const string TH_AUTO  = "Auto"
+const string TH_DARK  = "Ciemny"
+const string TH_LIGHT = "Jasny"
+
+const string S_SM = "Mały"
+const string S_MD = "Średni"
+const string S_LG = "Duży"
+
+const int R_FEAR = 0
+const int R_EUPH = 1
+const int R_NEU  = 2
+
+const color C_FEAR = #E5484D
+const color C_EUPH = #30A46C
+const color C_WARN = #F5A524
+const color C_NEU  = #8B8D98
+
+// ════════════════════════════════════════════════════════════════════════════════
+// USTAWIENIA (display.none = parametry nie zaśmiecają linii statusu)
+// ════════════════════════════════════════════════════════════════════════════════
+string vixSym  = input.symbol("TVC:VIX",    "VIX",                       group = GRP_SRC, display = display.none)
+string b50Sym  = input.symbol("INDEX:S5FI", "% spółek S&P 500 > SMA50",  group = GRP_SRC, display = display.none)
+string b200Sym = input.symbol("INDEX:S5TH", "% spółek S&P 500 > SMA200", group = GRP_SRC, display = display.none)
+string pcrSym  = input.symbol("USI:PCC",    "Put/Call Ratio",            group = GRP_SRC, display = display.none, tooltip = "USI:PCC = CBOE total (akcje + indeksy), do niego pasuje próg 1.02. USI:PCCE = tylko akcje (niższe wartości, zmień wtedy progi).")
+string spxSym  = input.symbol("SP:SPX",     "Indeks bazowy",             group = GRP_SRC, display = display.none)
+int    smaLen  = input.int(125, "Długość SMA indeksu (sesje)", minval = 10, group = GRP_SRC, display = display.none)
+int    pcrLen  = input.int(1,   "Wygładzanie Put/Call (sesje)", minval = 1, group = GRP_SRC, display = display.none, tooltip = "1 = surowy odczyt dzienny (jak w badaniu). 5–10 = mniej jednodniowych pików, sygnał nieco później.")
+
+bool useVix  = input.bool(true, "VIX",                   group = GRP_COMP, display = display.none)
+bool useB50  = input.bool(true, "Szerokość rynku MA50",  group = GRP_COMP, display = display.none)
+bool useB200 = input.bool(true, "Szerokość rynku MA200", group = GRP_COMP, display = display.none)
+bool usePcr  = input.bool(true, "Put/Call Ratio",        group = GRP_COMP, display = display.none)
+bool useDist = input.bool(true, "Odległość od SMA125",   group = GRP_COMP, display = display.none)
+
+float vixF  = input.float(22.8,  "VIX powyżej",                  step = 0.1,  group = GRP_FEAR, display = display.none)
+float b50F  = input.float(25.0,  "Breadth MA50 poniżej (%)",     step = 1.0,  group = GRP_FEAR, display = display.none, tooltip = "Próg własny (badanie go nie podaje). Typowe korekty: 10–25%.")
+float b200F = input.float(35.0,  "Breadth MA200 poniżej (%)",    step = 1.0,  group = GRP_FEAR, display = display.none, tooltip = "Próg własny, dobrany do rozkładu punktów Extreme Fear na wykresie rozrzutu z badania.")
+float pcrF  = input.float(1.02,  "Put/Call powyżej",             step = 0.01, group = GRP_FEAR, display = display.none)
+float distF = input.float(-0.14, "Odległość od SMA poniżej (%)", step = 0.1,  group = GRP_FEAR, display = display.none, tooltip = "Domyślnie -0.14% (wartość z opisu). Jeśli w badaniu chodziło o ułamek (-0.14 = -14%), wpisz -14. Ostrzejsze warianty: -5 / -10.")
+
+float vixE  = input.float(14.0, "VIX poniżej",                  step = 0.1,  group = GRP_EUPH, display = display.none)
+float b50E  = input.float(80.0, "Breadth MA50 powyżej (%)",     step = 1.0,  group = GRP_EUPH, display = display.none)
+float b200E = input.float(80.0, "Breadth MA200 powyżej (%)",    step = 1.0,  group = GRP_EUPH, display = display.none)
+float pcrE  = input.float(0.80, "Put/Call poniżej",             step = 0.01, group = GRP_EUPH, display = display.none)
+float distE = input.float(6.0,  "Odległość od SMA powyżej (%)", step = 0.1,  group = GRP_EUPH, display = display.none)
+
+string bMode    = input.string(BM_SEP, "Szerokość rynku", options = [BM_SEP, BM_ONE], group = GRP_LOGIC, display = display.none, tooltip = "Osobno: maks. 5 głosów. Łącznie: szerokość daje 1 głos tylko gdy MA50 i MA200 są jednocześnie za progiem (maks. 4 głosy).")
+int    minF     = input.int(3, "Min. potwierdzeń → EXTREME FEAR", minval = 1, maxval = 5, group = GRP_LOGIC, display = display.none)
+int    minE     = input.int(3, "Min. potwierdzeń → EUFORIA",      minval = 1, maxval = 5, group = GRP_LOGIC, display = display.none)
+bool   reqCore  = input.bool(false, "Wymagaj VIX lub Breadth MA200 wśród potwierdzeń", group = GRP_LOGIC, display = display.none, tooltip = "W badaniu VIX i Breadth MA200 miały najsilniejszą korelację z przyszłymi stopami zwrotu.")
+int    holdBars = input.int(5, "Utrzymaj reżim po zaniku (sesje)", minval = 0, maxval = 30, group = GRP_LOGIC, display = display.none, tooltip = "Usuwa migotanie: gdy liczba potwierdzeń na chwilę spadnie poniżej progu, reżim trwa jeszcze tyle sesji. Moment wejścia się nie zmienia. Działa tak samo na 1D i intraday (liczone w czasie), na 1W/1M wyłączone. 0 = surowy sygnał (jak w badaniu).")
+
+string mainStyle = input.string(MS_NONE, "Tło reżimu na wykresie głównym", options = [MS_NONE, MS_BG], group = GRP_MAIN, display = display.none, tooltip = "Pełne tło jest czytelne przy krótkim zakresie. Reżim zawsze widać w oknie wskaźnika.")
+int    bgAlpha   = input.int(92, "Przezroczystość pełnego tła", minval = 70, maxval = 98, group = GRP_MAIN, display = display.none)
+bool   marks     = input.bool(true,  "Znaczniki wejścia w panikę (▲)",   group = GRP_MAIN, display = display.none)
+bool   marksE    = input.bool(false, "Znaczniki wejścia w euforię (◆)",   group = GRP_MAIN, display = display.none, tooltip = "Euforia nie jest sygnałem sprzedaży, dlatego domyślnie bez znaczników.")
+int    mkGap     = input.int(30, "Min. odstęp między znacznikami (dni)", minval = 0, maxval = 365, group = GRP_MAIN, display = display.none, tooltip = "Jeden znacznik na epizod zamiast serii trójkątów. Nie wpływa na alerty.")
+
+string histStyle = input.string(HS_BAND, "Styl wykresu potwierdzeń", options = [HS_BAND, HS_COL], group = GRP_PANE, display = display.none, tooltip = "Pasmo jest czytelne przy dużym oddaleniu. Słupki są lepsze przy krótkim zakresie.")
+bool   bgPane    = input.bool(true, "Tło reżimu w oknie wskaźnika", group = GRP_PANE, display = display.none)
+
+bool   showTbl   = input.bool(true, "Pokaż panel",                  group = GRP_TBL, display = display.none)
+string dashWhere = input.string(W_MAIN, "Gdzie", options = [W_MAIN, W_PANE], group = GRP_TBL, display = display.none)
+string dashPos   = input.string(P_BL, "Pozycja", options = [P_BL, P_TL, P_ML, P_TR, P_MR, P_BR, P_BC], group = GRP_TBL, display = display.none, tooltip = "Lewy górny róg zajmuje legenda symbolu i przyciski kupna/sprzedaży TradingView. Lewy dolny jest zwykle pusty na wykresach w trendzie wzrostowym.")
+string txtSize   = input.string(S_SM, "Rozmiar tekstu", options = [S_SM, S_MD, S_LG], group = GRP_TBL, display = display.none)
+string themeIn   = input.string(TH_AUTO, "Motyw", options = [TH_AUTO, TH_DARK, TH_LIGHT], group = GRP_TBL, display = display.none, tooltip = "Auto dopasowuje kolory panelu do tła wykresu.")
+
+bool   showStat = input.bool(true, "Dołącz forward returns do panelu", group = GRP_STAT, display = display.none, tooltip = "Przyszłe stopy zwrotu po każdej świecy w danym reżimie. Działa na 1D, 1W i 1M. Okna nakładają się: to statystyka opisowa, nie test istotności.")
+string retMode  = input.string(RET_CHART, "Zwroty liczone dla", options = [RET_CHART, RET_IDX], group = GRP_STAT, display = display.none, tooltip = "Symbol wykresu: jak np. NVDA zachowywała się po panice na CAŁYM rynku. Indeks bazowy: odtworzenie badania na S&P 500.")
+int    statFrom = input.time(timestamp("2006-01-01T00:00:00"), "Statystyki od", group = GRP_STAT, display = display.none, tooltip = "Badanie obejmuje ok. 20 lat. Przed 2006 r. brakuje części danych (Put/Call), więc reżim liczyłby się z mniejszej liczby wskaźników.")
+string statM    = input.string(M_AVG, "Metryka", options = [M_AVG, M_WIN, M_HIT, M_RR, M_N], group = GRP_STAT, display = display.none)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERWAŁ
+// ════════════════════════════════════════════════════════════════════════════════
+int    tfSec    = timeframe.in_seconds()
+bool   isHigher = tfSec > 86400
+bool   isD1     = timeframe.isdaily and timeframe.multiplier == 1
+bool   isW1     = timeframe.isweekly and timeframe.multiplier == 1
+bool   isM1     = timeframe.ismonthly and timeframe.multiplier == 1
+string dTF      = isHigher ? timeframe.period : "D"           // świeca-po-świecy: D dla intraday i 1D
+string lowTF    = isHigher ? "D" : timeframe.period           // dni wewnątrz świecy W / M
+string unitTxt  = timeframe.isdaily ? "sesji" : timeframe.isweekly ? "tyg." : timeframe.ismonthly ? "mies." : "świec"
+
+// ════════════════════════════════════════════════════════════════════════════════
+// MOTYW
+// ════════════════════════════════════════════════════════════════════════════════
+float bgLuma = 0.299 * color.r(chart.bg_color) + 0.587 * color.g(chart.bg_color) + 0.114 * color.b(chart.bg_color)
+bool  darkUI = themeIn == TH_AUTO ? bgLuma < 140 : themeIn == TH_DARK
+
+color T_BG   = darkUI ? #1E222D : #FFFFFF
+color T_HEAD = darkUI ? #2A2E39 : #EEF1F6
+color T_LINE = darkUI ? #363A45 : #D5DAE3
+color T_TXT  = darkUI ? #E0E3EB : #131722
+color T_MUT  = darkUI ? #868993 : #6A6D78
+
+// ════════════════════════════════════════════════════════════════════════════════
+// DANE (bez lookahead → brak repaintingu na zamkniętych świecach)
+// ════════════════════════════════════════════════════════════════════════════════
+// a) intraday i 1D: wartość dzienna
+float vixD  = request.security(vixSym,  dTF, close,                 ignore_invalid_symbol = true)
+float b50D  = request.security(b50Sym,  dTF, close,                 ignore_invalid_symbol = true)
+float b200D = request.security(b200Sym, dTF, close,                 ignore_invalid_symbol = true)
+float pcrD  = request.security(pcrSym,  dTF, ta.sma(close, pcrLen), ignore_invalid_symbol = true)
+[spxD, spxMaD] = request.security(spxSym, dTF, [close, ta.sma(close, smaLen)], ignore_invalid_symbol = true)
+float distD = spxMaD > 0 ? (spxD / spxMaD - 1.0) * 100.0 : na
+
+// b) 1W / 1M: wszystkie dni wewnątrz świecy (SMA i wygładzanie liczone na danych dziennych)
+array<float> vixA  = request.security_lower_tf(vixSym,  lowTF, close,                 ignore_invalid_symbol = true)
+array<float> b50A  = request.security_lower_tf(b50Sym,  lowTF, close,                 ignore_invalid_symbol = true)
+array<float> b200A = request.security_lower_tf(b200Sym, lowTF, close,                 ignore_invalid_symbol = true)
+array<float> pcrA  = request.security_lower_tf(pcrSym,  lowTF, ta.sma(close, pcrLen), ignore_invalid_symbol = true)
+array<float> distA = request.security_lower_tf(spxSym,  lowTF, (close / ta.sma(close, smaLen) - 1.0) * 100.0, ignore_invalid_symbol = true)
+
+f_amax(array<float> a)  => a.size() > 0 ? a.max()  : na
+f_amin(array<float> a)  => a.size() > 0 ? a.min()  : na
+f_alast(array<float> a) => a.size() > 0 ? a.last() : na
+
+// Wartość testowana na panikę (najbardziej "strachliwy" dzień), na euforię (najbardziej "euforyczny") i do wyświetlenia (ostatni dzień)
+float vixFv  = isHigher ? f_amax(vixA)  : vixD
+float vixEv  = isHigher ? f_amin(vixA)  : vixD
+float vixSh  = isHigher ? f_alast(vixA) : vixD
+float b50Fv  = isHigher ? f_amin(b50A)  : b50D
+float b50Ev  = isHigher ? f_amax(b50A)  : b50D
+float b50Sh  = isHigher ? f_alast(b50A) : b50D
+float b200Fv = isHigher ? f_amin(b200A) : b200D
+float b200Ev = isHigher ? f_amax(b200A) : b200D
+float b200Sh = isHigher ? f_alast(b200A): b200D
+float pcrFv  = isHigher ? f_amax(pcrA)  : pcrD
+float pcrEv  = isHigher ? f_amin(pcrA)  : pcrD
+float pcrSh  = isHigher ? f_alast(pcrA) : pcrD
+float distFv = isHigher ? f_amin(distA) : distD
+float distEv = isHigher ? f_amax(distA) : distD
+float distSh = isHigher ? f_alast(distA): distD
+
+array<string> symParts = str.split(spxSym, ":")
+string spxName = symParts.size() > 1 ? symParts.last() : spxSym
+float  retSrc  = retMode == RET_CHART ? close : spxD
+string retName = retMode == RET_CHART ? syminfo.ticker : spxName
+
+// ════════════════════════════════════════════════════════════════════════════════
+// FUNKCJE
+// ════════════════════════════════════════════════════════════════════════════════
+bool sep = bMode == BM_SEP
+
+// Stan składnika: 1 = panika, -1 = euforia, 0 = neutralnie, na = wyłączony / brak danych
+f_state(bool on, float v, bool fearCond, bool euphCond) =>
+    int s = na
+    if on and not na(v)
+        s := fearCond ? 1 : euphCond ? -1 : 0
+    s
+
+f_vote(int s, int side) => s == side ? 1 : 0
+f_has(int s)            => na(s) ? 0 : 1
+
+f_breadth(int a, int b, int side) =>
+    int votes = 0
+    int avail = 0
+    if sep
+        votes := f_vote(a, side) + f_vote(b, side)
+        avail := f_has(a) + f_has(b)
+    else
+        bool anyOn  = useB50 or useB200
+        bool dataOk = (not useB50 or not na(a)) and (not useB200 or not na(b))
+        bool okA    = not useB50  or a == side
+        bool okB    = not useB200 or b == side
+        votes := anyOn and dataOk and okA and okB ? 1 : 0
+        avail := anyOn and dataOk ? 1 : 0
+    [votes, avail]
+
+f_pos(string p) =>
+    switch p
+        P_TL => position.top_left
+        P_ML => position.middle_left
+        P_BL => position.bottom_left
+        P_TR => position.top_right
+        P_MR => position.middle_right
+        P_BR => position.bottom_right
+        P_BC => position.bottom_center
+        => position.bottom_left
+
+f_txt(string s) =>
+    switch s
+        S_SM => size.small
+        S_MD => size.normal
+        S_LG => size.large
+        => size.small
+
+f_txtB(string s) =>
+    switch s
+        S_SM => size.normal
+        S_MD => size.large
+        S_LG => size.huge
+        => size.normal
+
+f_meter(int n, int m) =>
+    string out = ""
+    if m > 0
+        for i = 1 to m
+            out += i <= n ? "●" : "○"
+    out
+
+f_metric(array<float> v, array<float> all, string m) =>
+    int    n   = v.size()
+    string out = "—"
+    float  val = na
+    if n > 0
+        float avg = v.avg()
+        switch m
+            M_AVG =>
+                val := avg
+                out := str.tostring(avg, "0.00") + "%"
+            M_WIN =>
+                int w = 0
+                for x in v
+                    w += x > 0 ? 1 : 0
+                val := 100.0 * w / n
+                out := str.tostring(val, "0.0") + "%"
+            M_HIT =>
+                float bench = all.avg()
+                int   w     = 0
+                for x in v
+                    w += x > bench ? 1 : 0
+                val := 100.0 * w / n
+                out := str.tostring(val, "0.0") + "%"
+            M_RR =>
+                float sd = v.stdev()
+                val := sd > 0 ? avg / sd : na
+                out := na(val) ? "—" : str.tostring(val, "0.00")
+            M_N =>
+                out := str.tostring(n)
+    [out, val]
+
+f_row(table t, int r, string nm, float v, string fmt, string thrF, string thrE, int s, bool on, string sz) =>
+    bool   ok   = on and not na(s)
+    string stTx = not on ? "wył." : na(s) ? "brak danych" : s == 1 ? "● PANIKA" : s == -1 ? "● EUFORIA" : "neutralnie"
+    color  stBg = ok and s == 1 ? C_FEAR : ok and s == -1 ? C_EUPH : T_BG
+    color  stFg = ok and s != 0 ? color.white : T_MUT
+    color  vFg  = ok and s == 1 ? C_FEAR : ok and s == -1 ? C_EUPH : T_TXT
+    color  fBg  = ok and s == 1 ? color.new(C_FEAR, 85) : T_BG
+    color  eBg  = ok and s == -1 ? color.new(C_EUPH, 85) : T_BG
+    table.cell(t, 0, r, nm,                                  text_color = T_TXT, bgcolor = T_BG, text_halign = text.align_left,  text_size = sz)
+    table.cell(t, 1, r, na(v) ? "—" : str.tostring(v, fmt), text_color = vFg,   bgcolor = T_BG, text_halign = text.align_right, text_size = sz)
+    table.cell(t, 2, r, thrF,                                text_color = T_MUT, bgcolor = fBg,  text_size = sz)
+    table.cell(t, 3, r, thrE,                                text_color = T_MUT, bgcolor = eBg,  text_size = sz)
+    table.cell(t, 4, r, stTx,                                text_color = stFg,  bgcolor = stBg, text_size = sz)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// LOGIKA SYGNAŁU
+// ════════════════════════════════════════════════════════════════════════════════
+int sVix  = f_state(useVix,  vixFv,  vixFv  >  vixF,  vixEv  <  vixE)
+int sB50  = f_state(useB50,  b50Fv,  b50Fv  <  b50F,  b50Ev  >  b50E)
+int sB200 = f_state(useB200, b200Fv, b200Fv <  b200F, b200Ev >  b200E)
+int sPcr  = f_state(usePcr,  pcrFv,  pcrFv  >  pcrF,  pcrEv  <  pcrE)
+int sDist = f_state(useDist, distFv, distFv <= distF, distEv >= distE)
+
+[bFear, bAvail] = f_breadth(sB50, sB200, 1)
+[bEuph, bAvl2]  = f_breadth(sB50, sB200, -1)
+
+int fearCnt  = f_vote(sVix, 1)  + bFear + f_vote(sPcr, 1)  + f_vote(sDist, 1)
+int euphCnt  = f_vote(sVix, -1) + bEuph + f_vote(sPcr, -1) + f_vote(sDist, -1)
+int availCnt = f_has(sVix) + bAvail + f_has(sPcr) + f_has(sDist)
+int maxCnt   = (useVix ? 1 : 0) + (sep ? (useB50 ? 1 : 0) + (useB200 ? 1 : 0) : (useB50 or useB200 ? 1 : 0)) + (usePcr ? 1 : 0) + (useDist ? 1 : 0)
+
+bool dataOk = not na(spxD) and availCnt >= math.max(minF, minE)
+bool coreF  = sVix == 1  or sB200 == 1
+bool coreE  = sVix == -1 or sB200 == -1
+
+bool isFear = dataOk and fearCnt >= minF and (not reqCore or coreF)
+bool isEuph = dataOk and not isFear and euphCnt >= minE and (not reqCore or coreE)
+
+// Wygładzenie migotania (tylko 1D; świece W/M już agregują dni)
+// Liczone w czasie (sesje → dni kalendarzowe × 7/5), więc 1D i intraday pokazują ten sam stan
+int holdMs = isHigher ? 0 : math.round(holdBars * 86400000.0 * 1.4)
+var int lastFearT = na
+var int lastEuphT = na
+if isFear
+    lastFearT := time
+if isEuph
+    lastEuphT := time
+
+bool fearV    = dataOk and (isFear or (holdMs > 0 and not na(lastFearT) and time - lastFearT <= holdMs))
+bool euphV    = dataOk and not fearV and (isEuph or (holdMs > 0 and not na(lastEuphT) and time - lastEuphT <= holdMs))
+bool fearFade = fearV and not isFear
+bool euphFade = euphV and not isEuph
+int  reg   = dataOk ? (fearV ? R_FEAR : euphV ? R_EUPH : R_NEU) : na
+
+var int streak = 0
+streak := na(reg) ? 0 : reg == reg[1] ? streak + 1 : 1
+
+bool fearOn   = fearV and not fearV[1]
+bool fearOff  = not fearV and fearV[1]
+bool euphOn   = euphV and not euphV[1]
+bool euphOff  = not euphV and euphV[1]
+bool nearFear = dataOk and not fearV and fearCnt > 0 and fearCnt == minF - 1
+bool fearWarn = nearFear and not (fearCnt[1] == minF - 1 and not fearV[1])
+
+// Znaczniki: jeden na epizod (odstęp w dniach kalendarzowych)
+var int lastFearMk = na
+var int lastEuphMk = na
+bool fearMk = marks  and fearOn and (na(lastFearMk) or time - lastFearMk >= mkGap * 86400000)
+bool euphMk = marksE and euphOn and (na(lastEuphMk) or time - lastEuphMk >= mkGap * 86400000)
+if fearMk
+    lastFearMk := time
+if euphMk
+    lastEuphMk := time
+
+// ════════════════════════════════════════════════════════════════════════════════
+// OKNO WSKAŹNIKA
+// ════════════════════════════════════════════════════════════════════════════════
+bool  band     = histStyle == HS_BAND
+color fearColr = fearCnt >= minF ? C_FEAR : fearCnt == minF - 1 ? color.new(C_FEAR, 45) : color.new(C_FEAR, 75)
+color euphColr = euphCnt >= minE ? C_EUPH : euphCnt == minE - 1 ? color.new(C_EUPH, 45) : color.new(C_EUPH, 75)
+
+float fearVal = dataOk ? fearCnt : na
+float euphVal = dataOk ? -euphCnt : na
+
+// Słupki
+plot(not band and fearCnt > 0 ? fearVal : na, "Panika (słupki)",  fearColr, style = plot.style_columns, display = display.all - display.status_line)
+plot(not band and euphCnt > 0 ? euphVal : na, "Euforia (słupki)", euphColr, style = plot.style_columns, display = display.all - display.status_line)
+
+// Pasmo: linia schodkowa + wypełnienie do zera
+pZero = plot(dataOk ? 0 : na, "Zero (pomocnicza)", display = display.none)
+pFear = plot(band ? fearVal : na, "Panika (pasmo)",  fearCnt >= minF ? C_FEAR : fearCnt == minF - 1 ? color.new(C_FEAR, 40) : color.new(C_FEAR, 80), style = plot.style_stepline, linewidth = 1, display = display.all - display.status_line)
+pEuph = plot(band ? euphVal : na, "Euforia (pasmo)", euphCnt >= minE ? C_EUPH : euphCnt == minE - 1 ? color.new(C_EUPH, 40) : color.new(C_EUPH, 80), style = plot.style_stepline, linewidth = 1, display = display.all - display.status_line)
+fill(pFear, pZero, band ? (fearCnt >= minF ? color.new(C_FEAR, 40) : fearCnt == minF - 1 ? color.new(C_FEAR, 78) : na) : na, title = "Panika (wypełnienie)")
+fill(pEuph, pZero, band ? (euphCnt >= minE ? color.new(C_EUPH, 40) : euphCnt == minE - 1 ? color.new(C_EUPH, 78) : na) : na, title = "Euforia (wypełnienie)")
+
+hline(minF,  "Próg EXTREME FEAR", color = color.new(C_FEAR, 35), linestyle = hline.style_dashed)
+hline(-minE, "Próg EUFORII",      color = color.new(C_EUPH, 35), linestyle = hline.style_dashed)
+hline(0,     "Zero",              color = color.new(C_NEU, 55),  linestyle = hline.style_solid)
+hline(5,  "Skala góra", color = color.new(C_NEU, 100), display = display.none)
+hline(-5, "Skala dół",  color = color.new(C_NEU, 100), display = display.none)
+
+color regCol = fearV ? C_FEAR : euphV ? C_EUPH : na
+bgcolor(bgPane and not na(regCol) ? color.new(regCol, 92) : na, title = "Tło reżimu (okno wskaźnika)")
+
+// ════════════════════════════════════════════════════════════════════════════════
+// WYKRES GŁÓWNY
+// ════════════════════════════════════════════════════════════════════════════════
+bgcolor(mainStyle == MS_BG and not na(regCol) ? color.new(regCol, bgAlpha) : na, title = "Tło reżimu (wykres główny)", force_overlay = true)
+plotshape(fearMk, "Wejście: EXTREME FEAR", shape.triangleup, location.belowbar, C_FEAR, size = size.small, force_overlay = true, display = display.all - display.status_line)
+plotshape(euphMk, "Wejście: EUFORIA",      shape.diamond,    location.abovebar, C_EUPH, size = size.tiny,  force_overlay = true, display = display.all - display.status_line)
+
+// Surowe wartości tylko w oknie danych
+plot(vixSh,  "VIX",                  display = display.data_window, precision = 2)
+plot(b50Sh,  "Breadth MA50 (%)",     display = display.data_window, precision = 1)
+plot(b200Sh, "Breadth MA200 (%)",    display = display.data_window, precision = 1)
+plot(pcrSh,  "Put/Call",             display = display.data_window, precision = 2)
+plot(distSh, "Odległość od SMA (%)", display = display.data_window, precision = 2)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PANEL
+// ════════════════════════════════════════════════════════════════════════════════
+bool inMain = dashWhere == W_MAIN
+int  dRows  = showStat ? 16 : 9
+
+var table dashM = table.new(f_pos(dashPos), 5, dRows, border_color = T_LINE, border_width = 1, frame_color = T_LINE, frame_width = 1, force_overlay = true)
+var table dashP = table.new(f_pos(dashPos), 5, dRows, border_color = T_LINE, border_width = 1, frame_color = T_LINE, frame_width = 1, force_overlay = false)
+table dash = inMain ? dashM : dashP
+
+string noteTF = isHigher ? "Interwał " + timeframe.period + ": składnik głosuje, gdy próg przekroczono w dowolnym dniu świecy" : timeframe.isintraday ? "Intraday: bieżące odczyty dzienne, ostateczne po zamknięciu sesji" : ""
+
+if showTbl and barstate.islast
+    string sz  = f_txt(txtSize)
+    string szB = f_txtB(txtSize)
+
+    string bTxt = "BRAK DANYCH"
+    color  bBg  = T_HEAD
+    color  bFg  = T_TXT
+    if not na(reg)
+        string ses = "   ·   " + str.tostring(streak) + " " + unitTxt
+        if reg == R_FEAR
+            bTxt := "EXTREME FEAR" + (fearFade ? " · wygasa" : "") + "   " + f_meter(fearCnt, maxCnt) + "  " + str.tostring(fearCnt) + "/" + str.tostring(maxCnt) + ses
+            bBg  := fearFade ? color.new(C_FEAR, 35) : C_FEAR
+            bFg  := color.white
+        else if reg == R_EUPH
+            bTxt := "EUFORIA" + (euphFade ? " · wygasa" : "") + "   " + f_meter(euphCnt, maxCnt) + "  " + str.tostring(euphCnt) + "/" + str.tostring(maxCnt) + ses
+            bBg  := euphFade ? color.new(C_EUPH, 35) : C_EUPH
+            bFg  := color.white
+        else
+            bTxt := "NEUTRALNIE   " + f_meter(fearCnt, maxCnt) + "  " + str.tostring(fearCnt) + "/" + str.tostring(maxCnt) + (nearFear ? "   ·   blisko paniki" : "") + ses
+            bBg  := nearFear ? C_WARN : T_HEAD
+            bFg  := nearFear ? #131722 : T_TXT
+    table.cell(dash, 0, 0, bTxt, text_color = bFg, bgcolor = bBg, text_size = szB)
+    table.merge_cells(dash, 0, 0, 4, 0)
+
+    table.cell(dash, 0, 1, "Rynek USA (S&P 500)", text_color = T_MUT, bgcolor = T_HEAD, text_halign = text.align_left,  text_size = sz)
+    table.cell(dash, 1, 1, "Wartość", text_color = T_MUT,  bgcolor = T_HEAD, text_halign = text.align_right, text_size = sz)
+    table.cell(dash, 2, 1, "Panika",  text_color = C_FEAR, bgcolor = T_HEAD, text_size = sz)
+    table.cell(dash, 3, 1, "Euforia", text_color = C_EUPH, bgcolor = T_HEAD, text_size = sz)
+    table.cell(dash, 4, 1, "Stan",    text_color = T_MUT,  bgcolor = T_HEAD, text_size = sz)
+
+    f_row(dash, 2, "VIX",             vixSh,  "0.00", "> " + str.tostring(vixF),        "< " + str.tostring(vixE),        sVix,  useVix,  sz)
+    f_row(dash, 3, "Breadth MA50 %",  b50Sh,  "0.0",  "< " + str.tostring(b50F) + "%",  "> " + str.tostring(b50E) + "%",  sB50,  useB50,  sz)
+    f_row(dash, 4, "Breadth MA200 %", b200Sh, "0.0",  "< " + str.tostring(b200F) + "%", "> " + str.tostring(b200E) + "%", sB200, useB200, sz)
+    f_row(dash, 5, "Put/Call",        pcrSh,  "0.00", "> " + str.tostring(pcrF),        "< " + str.tostring(pcrE),        sPcr,  usePcr,  sz)
+    f_row(dash, 6, spxName + " vs SMA" + str.tostring(smaLen) + " %", distSh, "0.00", "≤ " + str.tostring(distF) + "%", "≥ " + str.tostring(distE) + "%", sDist, useDist, sz)
+
+    table.cell(dash, 0, 7, "Potwierdzenia", text_color = T_TXT, bgcolor = T_HEAD, text_halign = text.align_left, text_size = sz)
+    table.cell(dash, 1, 7, "", bgcolor = T_HEAD, text_size = sz)
+    table.cell(dash, 2, 7, "▲ " + str.tostring(fearCnt) + "/" + str.tostring(maxCnt), text_color = fearCnt >= minF ? C_FEAR : T_TXT, bgcolor = T_HEAD, text_size = sz)
+    table.cell(dash, 3, 7, "▼ " + str.tostring(euphCnt) + "/" + str.tostring(maxCnt), text_color = euphCnt >= minE ? C_EUPH : T_TXT, bgcolor = T_HEAD, text_size = sz)
+    table.cell(dash, 4, 7, "próg " + str.tostring(minF) + " / " + str.tostring(minE),  text_color = T_MUT, bgcolor = T_HEAD, text_size = sz)
+
+    if not showStat and noteTF != ""
+        table.cell(dash, 0, 8, noteTF, text_color = T_MUT, bgcolor = T_HEAD, text_halign = text.align_left, text_size = size.tiny)
+        table.merge_cells(dash, 0, 8, 4, 8)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// STATYSTYKI: FORWARD RETURNS PER REŻIM (1M / 12M / 3Y / 5Y)
+// ════════════════════════════════════════════════════════════════════════════════
+type Bucket
+    array<float> vals
+
+bool statTF = isD1 or isW1 or isM1
+
+var array<Bucket> bk  = array.new<Bucket>()
+var array<int>    HZ  = isW1 ? array.from(4, 52, 156, 260) : isM1 ? array.from(1, 12, 36, 60) : array.from(21, 252, 756, 1260)
+var array<string> HZN = array.from("1M", "12M", "3Y", "5Y")
+
+if barstate.isfirst
+    // indeks = grupa * 4 + horyzont; grupy: 0 = Extreme Fear, 1 = Euforia, 2 = Neutralnie, 3 = Wszystkie
+    for i = 0 to 15
+        bk.push(Bucket.new(array.new<float>()))
+
+var int firstT = na
+if dataOk and na(firstT) and not na(retSrc) and time >= statFrom
+    firstT := time
+
+// Rynki zamykające się przed Wall Street (np. GPW, Europa, Azja): sygnał z sesji USA jest znany dopiero
+// po zamknięciu tej giełdy, więc wejście liczymy od zamknięcia NASTĘPNEJ świecy (brak look-ahead bias).
+int lagS = isD1 and retMode == RET_CHART and syminfo.timezone != "America/New_York" ? 1 : 0
+
+if showTbl and showStat and statTF and barstate.isconfirmed
+    for [hi, h] in HZ
+        if bar_index >= h
+            float p0 = retSrc[h - lagS]
+            int   g0 = reg[h]
+            if not na(p0) and p0 > 0 and not na(retSrc) and not na(g0) and time[h] >= statFrom
+                float r = (retSrc / p0 - 1.0) * 100.0
+                bk.get(g0 * 4 + hi).vals.push(r)
+                bk.get(12 + hi).vals.push(r)
+
+if showTbl and showStat and barstate.islastconfirmedhistory
+    string sz = f_txt(txtSize)
+    if not statTF
+        table.cell(dash, 0, 8, "Forward returns: przełącz wykres na 1D, 1W lub 1M", text_color = C_WARN, bgcolor = T_HEAD, text_size = sz)
+        table.merge_cells(dash, 0, 8, 4, 8)
+        if noteTF != ""
+            table.cell(dash, 0, 9, noteTF, text_color = T_MUT, bgcolor = T_HEAD, text_halign = text.align_left, text_size = size.tiny)
+            table.merge_cells(dash, 0, 9, 4, 9)
+    else
+        table.cell(dash, 0, 8, "Co działo się z " + retName + " po sygnale · " + statM, text_color = T_TXT, bgcolor = T_HEAD, text_halign = text.align_left, text_size = sz)
+        table.merge_cells(dash, 0, 8, 4, 8)
+        table.cell(dash, 0, 9, "Reżim rynku", text_color = T_MUT, bgcolor = T_HEAD, text_halign = text.align_left, text_size = sz)
+        for hi = 0 to 3
+            table.cell(dash, hi + 1, 9, HZN.get(hi), text_color = T_MUT, bgcolor = T_HEAD, text_size = sz)
+
+        array<string> names = array.from("Extreme Fear", "Euforia", "Neutralnie", "Wszystkie")
+        array<color>  cols  = array.from(C_FEAR, C_EUPH, T_MUT, T_TXT)
+        for g = 0 to 3
+            table.cell(dash, 0, g + 10, names.get(g), text_color = cols.get(g), bgcolor = T_BG, text_halign = text.align_left, text_size = sz)
+
+        for hi = 0 to 3
+            array<float> allV = bk.get(12 + hi).vals
+            float best = na
+            for g = 0 to 2
+                [t0, v0] = f_metric(bk.get(g * 4 + hi).vals, allV, statM)
+                if not na(v0) and (na(best) or v0 > best)
+                    best := v0
+            for g = 0 to 3
+                [txt, val] = f_metric(bk.get(g * 4 + hi).vals, allV, statM)
+                bool isBest = g < 3 and statM != M_N and not na(val) and val == best
+                table.cell(dash, hi + 1, g + 10, txt, text_color = isBest ? #131722 : T_TXT, bgcolor = isBest ? color.new(C_WARN, 35) : T_BG, text_halign = text.align_right, text_size = sz)
+
+        string since = na(firstT) ? "—" : str.format_time(firstT, "yyyy-MM-dd", "America/New_York")
+        table.cell(dash, 0, 14, "dane od " + since + (lagS > 0 ? " · wejście sesję po sygnale USA" : "") + " · okna nakładają się · żółte = najlepszy reżim", text_color = T_MUT, bgcolor = T_HEAD, text_halign = text.align_left, text_size = size.tiny)
+        table.merge_cells(dash, 0, 14, 4, 14)
+        if noteTF != ""
+            table.cell(dash, 0, 15, noteTF, text_color = T_MUT, bgcolor = T_HEAD, text_halign = text.align_left, text_size = size.tiny)
+            table.merge_cells(dash, 0, 15, 4, 15)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// ALERTY
+// ════════════════════════════════════════════════════════════════════════════════
+alertcondition(fearOn,   "① Wejście w EXTREME FEAR",     "Panic Meter: EXTREME FEAR — panika potwierdzona przez wymaganą liczbę wskaźników (S&P 500).")
+alertcondition(fearOff,  "② Wyjście z EXTREME FEAR",     "Panic Meter: koniec stanu EXTREME FEAR (S&P 500).")
+alertcondition(fearWarn, "③ Ostrzeżenie: blisko paniki", "Panic Meter: brakuje 1 potwierdzenia do EXTREME FEAR (S&P 500).")
+alertcondition(euphOn,   "④ Wejście w EUFORIĘ",          "Panic Meter: EUFORIA na S&P 500.")
+alertcondition(euphOff,  "⑤ Wyjście z EUFORII",          "Panic Meter: koniec stanu EUFORII (S&P 500).")
+
+f_snap() =>
+    "VIX " + str.tostring(vixSh, "0.00") + " | MA50 " + str.tostring(b50Sh, "0.0") + "% | MA200 " + str.tostring(b200Sh, "0.0") + "% | P/C " + str.tostring(pcrSh, "0.00") + " | SPX vs SMA " + str.tostring(distSh, "0.00") + "%"
+
+if fearOn
+    alert("Panic Meter ▲ EXTREME FEAR (" + str.tostring(fearCnt) + "/" + str.tostring(maxCnt) + ") · " + f_snap(), alert.freq_once_per_bar_close)
+if euphOn
+    alert("Panic Meter ▼ EUFORIA (" + str.tostring(euphCnt) + "/" + str.tostring(maxCnt) + ") · " + f_snap(), alert.freq_once_per_bar_close)
+if fearOff
+    alert("Panic Meter · koniec EXTREME FEAR · " + f_snap(), alert.freq_once_per_bar_close)

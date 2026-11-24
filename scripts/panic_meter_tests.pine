@@ -1,0 +1,408 @@
+//@version=6
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Igor (github.com/ig0ko/market-panic-meter)
+//
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  MARKET PANIC METER · TEST ZBIORCZY                                v1.2.0    ║
+// ╠══════════════════════════════════════════════════════════════════════════════╣
+// ║  Liczy naraz wszystkie warianty backtestu i pokazuje je w tabelach:          ║
+// ║   A · kupuj panikę, trzymaj 63 / 252 / 756 sesji                              ║
+// ║       × sygnał: 3 potw. · 4 potw. · 3 potw. z progiem SMA −10%               ║
+// ║   C · kup i trzymaj, sprzedaj w euforii (+ wiersz „kup i trzymaj”)          ║
+// ║   B · DCA vs DCA + rezerwa (rezerwa 0/10/20/30%, transza 33%/100%)          ║
+// ║  Każdy wariant w 3 okresach: całość, do daty podziału, od daty podziału.     ║
+// ║  Wejścia/wyjścia na otwarciu następnej sesji, prowizja od każdej transakcji. ║
+// ║  Wykres: AMEX:SPY, 1D, z dywidendami (ADJ). Narzędzie edukacyjne.            ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+indicator("Panic Meter · Test zbiorczy", shorttitle = "PM Testy", overlay = true, max_bars_back = 1500)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// STAŁE
+// ════════════════════════════════════════════════════════════════════════════════
+const string V_AC  = "Testy A i C"
+const string V_B   = "Test B (DCA)"
+const string V_ALL = "Wszystkie tabele (wolniej)"
+
+const string GRP_T = "① Okresy i widok"
+const string GRP_S = "② Sygnał (jak we wskaźniku)"
+const string GRP_V = "③ Warianty"
+const string GRP_B = "④ Test B"
+const string GRP_D = "⑤ Źródła danych"
+
+const color C_POS  = #30A46C
+const color C_NEG  = #E5484D
+const color C_HEAD = #EEF1F6
+const color C_BG   = #FFFFFF
+const color C_TXT  = #131722
+const color C_MUT  = #6A6D78
+const color C_LINE = #D5DAE3
+const color C_BEST = #FFE8B0
+
+// ════════════════════════════════════════════════════════════════════════════════
+// USTAWIENIA
+// ════════════════════════════════════════════════════════════════════════════════
+string view    = input.string(V_AC, "Pokaż", options = [V_AC, V_B, V_ALL], group = GRP_T, display = display.none)
+int    tStart  = input.time(timestamp("2006-01-01T00:00:00"), "Początek testu", group = GRP_T, display = display.none)
+int    tSplit  = input.time(timestamp("2016-01-01T00:00:00"), "Data podziału na 2 okresy", group = GRP_T, display = display.none, tooltip = "Przewaga powinna wyjść w obu okresach, inaczej to raczej przypadek.")
+float  comm    = input.float(0.1, "Prowizja (%)", minval = 0, maxval = 2, step = 0.05, group = GRP_T, display = display.none) / 100.0
+string txtSz   = input.string("Mały", "Rozmiar tekstu", options = ["Mały", "Średni"], group = GRP_T, display = display.none)
+
+float vixF  = input.float(22.8,  "VIX powyżej",                  step = 0.1,  group = GRP_S, display = display.none)
+float b50F  = input.float(25.0,  "Breadth MA50 poniżej (%)",     step = 1.0,  group = GRP_S, display = display.none)
+float b200F = input.float(35.0,  "Breadth MA200 poniżej (%)",    step = 1.0,  group = GRP_S, display = display.none)
+float pcrF  = input.float(1.02,  "Put/Call powyżej",             step = 0.01, group = GRP_S, display = display.none)
+float distF = input.float(-0.14, "Odległość od SMA poniżej (%)", step = 0.1,  group = GRP_S, display = display.none)
+int   minF  = input.int(3, "Min. potwierdzeń → EXTREME FEAR", minval = 1, maxval = 5, group = GRP_S, display = display.none)
+float vixE  = input.float(14.0, "Euforia: VIX poniżej",               step = 0.1,  group = GRP_S, display = display.none)
+float b50E  = input.float(80.0, "Euforia: Breadth MA50 powyżej (%)",  step = 1.0,  group = GRP_S, display = display.none)
+float b200E = input.float(80.0, "Euforia: Breadth MA200 powyżej (%)", step = 1.0,  group = GRP_S, display = display.none)
+float pcrE  = input.float(0.80, "Euforia: Put/Call poniżej",          step = 0.01, group = GRP_S, display = display.none)
+float distE = input.float(6.0,  "Euforia: odległość od SMA powyżej (%)", step = 0.1, group = GRP_S, display = display.none)
+int   minE  = input.int(3, "Min. potwierdzeń → EUFORIA", minval = 1, maxval = 5, group = GRP_S, display = display.none)
+int   holdB = input.int(5, "Utrzymaj reżim po zaniku (sesje)", minval = 0, maxval = 30, group = GRP_S, display = display.none)
+
+int   minF2  = input.int(4, "Wariant ostrzejszy: min. potwierdzeń", minval = 1, maxval = 5, group = GRP_V, display = display.none)
+float distF2 = input.float(-10.0, "Wariant ostrzejszy: odległość od SMA (%)", step = 0.5, group = GRP_V, display = display.none)
+int   n1     = input.int(63,  "Test A: trzymaj (sesje) #1", minval = 5, maxval = 1260, group = GRP_V, display = display.none)
+int   n2     = input.int(252, "Test A: trzymaj (sesje) #2", minval = 5, maxval = 1260, group = GRP_V, display = display.none)
+int   n3     = input.int(756, "Test A: trzymaj (sesje) #3", minval = 5, maxval = 1260, group = GRP_V, display = display.none)
+
+float monthly = input.float(1000, "Wpłata miesięczna (USD)", minval = 1, group = GRP_B, display = display.none)
+int   trEvery = input.int(10, "Kolejna transza co (sesje)", minval = 1, maxval = 120, group = GRP_B, display = display.none)
+
+string vixSym  = input.symbol("TVC:VIX",    "VIX",                       group = GRP_D, display = display.none)
+string b50Sym  = input.symbol("INDEX:S5FI", "% spółek S&P 500 > SMA50",  group = GRP_D, display = display.none)
+string b200Sym = input.symbol("INDEX:S5TH", "% spółek S&P 500 > SMA200", group = GRP_D, display = display.none)
+string pcrSym  = input.symbol("USI:PCC",    "Put/Call Ratio",            group = GRP_D, display = display.none)
+string spxSym  = input.symbol("SP:SPX",     "Indeks do sygnału",         group = GRP_D, display = display.none)
+int    smaLen  = input.int(125, "Długość SMA indeksu", minval = 10,      group = GRP_D, display = display.none)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SYGNAŁ (dane dzienne, bez lookahead)
+// ════════════════════════════════════════════════════════════════════════════════
+float vix  = request.security(vixSym,  "D", close, ignore_invalid_symbol = true)
+float b50  = request.security(b50Sym,  "D", close, ignore_invalid_symbol = true)
+float b200 = request.security(b200Sym, "D", close, ignore_invalid_symbol = true)
+float pcr  = request.security(pcrSym,  "D", close, ignore_invalid_symbol = true)
+[spx, spxMa] = request.security(spxSym, "D", [close, ta.sma(close, smaLen)], ignore_invalid_symbol = true)
+float dist = spxMa > 0 ? (spx / spxMa - 1.0) * 100.0 : na
+
+f_v(float v, bool cond) => not na(v) and cond ? 1 : 0
+f_h(float v)            => na(v) ? 0 : 1
+
+int baseF  = f_v(vix, vix > vixF) + f_v(b50, b50 < b50F) + f_v(b200, b200 < b200F) + f_v(pcr, pcr > pcrF)
+int cnt0   = baseF + f_v(dist, dist <= distF)
+int cnt2   = baseF + f_v(dist, dist <= distF2)
+int cntE   = f_v(vix, vix < vixE) + f_v(b50, b50 > b50E) + f_v(b200, b200 > b200E) + f_v(pcr, pcr < pcrE) + f_v(dist, dist >= distE)
+int avail  = f_h(vix) + f_h(b50) + f_h(b200) + f_h(pcr) + f_h(dist)
+bool dataOk = not na(spx) and avail >= math.max(minF, minE)
+
+// Utrzymanie reżimu po zaniku sygnału (osobny licznik dla każdego wywołania)
+f_hold(bool raw, int hb) =>
+    var int left = 0
+    left := raw ? hb : math.max(left - 1, 0)
+    raw or left > 0
+
+bool fV0 = dataOk and f_hold(dataOk and cnt0 >= minF,  holdB)   // sygnał bazowy
+bool fV1 = dataOk and f_hold(dataOk and cnt0 >= minF2, holdB)   // więcej potwierdzeń
+bool fV2 = dataOk and f_hold(dataOk and cnt2 >= minF,  holdB)   // ostrzejszy próg SMA
+bool eV  = dataOk and f_hold(dataOk and cnt0 < minF and cntE >= minE, holdB) and not fV0
+
+bool fOn0  = fV0 and not fV0[1]
+bool fOn1  = fV1 and not fV1[1]
+bool fOn2  = fV2 and not fV2[1]
+bool eOn   = eV and not eV[1]
+
+plot(na, "pomocnicza", display = display.none)
+
+bool isD1     = timeframe.isdaily and timeframe.multiplier == 1
+bool newMonth = month(time) != month(time[1])
+
+// SYMULACJE (zoptymalizowane pod limit czasu planu Basic)
+//  · okres „do podziału” to migawka okresu „całość” w dniu podziału (ta sama symulacja)
+//  · liczony jest tylko zestaw wybrany w polu „Pokaż”
+// ════════════════════════════════════════════════════════════════════════════════
+// mode: 0 = test A, 1 = test C, 2 = kup i trzymaj
+type Sim
+    int   mode
+    int   sig
+    int   n
+    float cash     = 10000.0
+    float sh       = 0.0
+    bool  pendBuy  = false
+    bool  pendSell = false
+    int   entryBar = -1
+    float entryVal = 0.0
+    int   trades   = 0
+    int   closed   = 0
+    int   wins     = 0
+    int   barsIn   = 0
+    float peak     = 10000.0
+    float dd       = 0.0
+
+type SimB
+    float res
+    float tr
+    bool  started = false
+    float sh      = 0.0
+    float cash    = 0.0
+    float q       = 0.0
+    float paid    = 0.0
+    int   nTr     = 0
+    int   lastTr  = -1
+    float peak    = 0.0
+    float dd      = 0.0
+
+f_valA(Sim s)  => s.cash + s.sh * close
+f_valB(SimB s) => s.sh * close + s.q + s.cash
+
+f_stepA(Sim s, bool fOn) =>
+    // 1) realizacja zleceń z poprzedniej sesji po cenie otwarcia
+    if s.pendBuy
+        s.entryVal := s.cash
+        s.sh       := s.cash * (1 - comm) / open
+        s.cash     := 0.0
+        s.entryBar := bar_index
+        s.trades   := s.trades + 1
+        s.pendBuy  := false
+    if s.pendSell
+        s.cash     := s.sh * open * (1 - comm)
+        s.sh       := 0.0
+        s.closed   := s.closed + 1
+        s.wins     := s.cash > s.entryVal ? s.wins + 1 : s.wins
+        s.barsIn   := s.barsIn + (bar_index - s.entryBar)
+        s.entryBar := -1
+        s.pendSell := false
+        if s.cash > s.peak
+            s.peak := s.cash
+    // 2) w pozycji: wycena i spadek; decyzja o wyjściu
+    if s.sh > 0
+        float eq = s.sh * close
+        if eq > s.peak
+            s.peak := eq
+        else
+            float d = (s.peak - eq) / s.peak * 100
+            if d > s.dd
+                s.dd := d
+        if not s.pendSell
+            if s.mode == 0
+                if bar_index - s.entryBar >= s.n - 1
+                    s.pendSell := true
+            else if s.mode == 1
+                if eOn
+                    s.pendSell := true
+    // 3) poza pozycją: decyzja o wejściu
+    else if not s.pendBuy
+        if s.mode == 0 ? fOn : s.mode == 1 ? not eV : true
+            s.pendBuy := true
+
+f_stepB(SimB s) =>
+    if s.q > 0
+        s.sh := s.sh + s.q * (1 - comm) / open
+        s.q  := 0.0
+    if newMonth or not s.started
+        s.started := true
+        s.paid    := s.paid + monthly
+        s.q       := s.q + monthly * (1 - s.res)
+        s.cash    := s.cash + monthly * s.res
+    if fV0
+        if s.cash > 1 and (fOn0 or s.lastTr < 0 or bar_index - s.lastTr >= trEvery)
+            float t = s.cash * s.tr
+            if s.cash - t < monthly * 0.05
+                t := s.cash
+            s.cash   := s.cash - t
+            s.q      := s.q + t
+            s.nTr    := s.nTr + 1
+            s.lastTr := bar_index
+    else
+        s.lastTr := -1
+    float v = s.sh * close + s.q + s.cash
+    if v > s.peak
+        s.peak := v
+    else if s.peak > 0
+        float d = (s.peak - v) / s.peak * 100
+        if d > s.dd
+            s.dd := d
+
+var array<int>   NS  = array.from(n1, n2, n3)
+var array<float> RES = array.from(0.0, 0.10, 0.10, 0.20, 0.20, 0.30, 0.30)
+var array<float> TRS = array.from(1.0, 0.33, 1.00, 0.33, 1.00, 0.33, 1.00)
+
+// simsA: 0..10 = okres całość, 11..21 = od podziału; k 0..8 = A (sygnał*3 + trzymanie), 9 = C, 10 = kup i trzymaj
+// simsB: 0..6  = okres całość, 7..13  = od podziału
+var array<Sim>  simsA = array.new<Sim>()
+var array<SimB> simsB = array.new<SimB>()
+if barstate.isfirst
+    for blk = 0 to 1
+        for g = 0 to 2
+            for ni = 0 to 2
+                simsA.push(Sim.new(mode = 0, sig = g, n = NS.get(ni)))
+        simsA.push(Sim.new(mode = 1, sig = 0, n = 0))
+        simsA.push(Sim.new(mode = 2, sig = 0, n = 0))
+        for k = 0 to 6
+            simsB.push(SimB.new(res = RES.get(k), tr = TRS.get(k)))
+
+bool showAC = view == V_AC or view == V_ALL
+bool showB  = view == V_B  or view == V_ALL
+
+// Migawka okresu „do podziału”
+var array<float> snapA   = array.new<float>(11, na)
+var array<float> snapBv  = array.new<float>(7, na)
+var array<float> snapBd  = array.new<float>(7, na)
+var float        snapPd  = na
+var bool         snapped = false
+var int          barStart = na
+var int          barSplit = na
+
+bool act0 = isD1 and barstate.isconfirmed and time >= tStart
+bool act2 = isD1 and barstate.isconfirmed and time >= tSplit
+
+if act0 and na(barStart)
+    barStart := bar_index
+if act2 and not snapped
+    snapped  := true
+    barSplit := bar_index
+    for k = 0 to 10
+        snapA.set(k, (f_valA(simsA.get(k)) / 10000.0 - 1) * 100)
+    for k = 0 to 6
+        SimB sb = simsB.get(k)
+        snapBv.set(k, f_valB(sb))
+        snapBd.set(k, sb.dd)
+    snapPd := simsB.get(0).paid
+
+if act0
+    if showAC
+        for i = 0 to 10
+            Sim s = simsA.get(i)
+            f_stepA(s, s.sig == 0 ? fOn0 : s.sig == 1 ? fOn1 : fOn2)
+    if showB
+        for i = 0 to 6
+            f_stepB(simsB.get(i))
+if act2
+    if showAC
+        for i = 11 to 21
+            Sim s = simsA.get(i)
+            f_stepA(s, s.sig == 0 ? fOn0 : s.sig == 1 ? fOn1 : fOn2)
+    if showB
+        for i = 7 to 13
+            f_stepB(simsB.get(i))
+
+// ════════════════════════════════════════════════════════════════════════════════
+// TABELE
+// ════════════════════════════════════════════════════════════════════════════════
+string sz = txtSz == "Mały" ? size.small : size.normal
+
+f_pct(float x) => na(x) ? "—" : (x >= 0 ? "+" : "") + str.tostring(x, "0.0") + "%"
+f_usd(float v) => na(v) ? "—" : str.tostring(math.round(v), "#,###") + " $"
+f_ret(Sim s)   => (f_valA(s) / 10000.0 - 1) * 100
+
+f_c(table t, int c, int r, string txt, color fg, color bg) =>
+    table.cell(t, c, r, txt, text_color = fg, bgcolor = bg, text_size = sz, text_halign = c == 0 ? text.align_left : text.align_right)
+
+string y0 = str.format_time(tStart + 3 * 86400000, "yyyy")
+string yS = str.format_time(tSplit + 3 * 86400000, "yyyy")
+array<string> PN = array.from(y0 + "–dziś", y0 + "–" + yS, yS + "–dziś")
+array<string> SN = array.from(str.tostring(minF) + " potw.", str.tostring(minF2) + " potw.", "SMA " + str.tostring(distF2) + "%")
+
+// Każda tabela w innym rogu: dwie tabele w tym samym miejscu zasłaniają się nawzajem
+var table tA = table.new(view == V_B ? position.bottom_left : position.top_right, 11, 16, bgcolor = C_BG, border_color = C_LINE, border_width = 1, frame_color = C_LINE, frame_width = 1)
+var table tB = table.new(view == V_B ? position.top_right : position.bottom_right, 10, 12, bgcolor = C_BG, border_color = C_LINE, border_width = 1, frame_color = C_LINE, frame_width = 1)
+
+var bool drawn = false
+if (barstate.islastconfirmedhistory or barstate.islast) and not drawn
+    drawn := true
+    if not isD1
+        f_c(tA, 0, 0, "Test zbiorczy działa tylko na interwale 1D", C_NEG, C_HEAD)
+    else if na(barStart)
+        f_c(tA, 0, 0, "Brak danych od daty początku testu: przesuń „Początek testu” później", C_NEG, C_HEAD)
+    else
+        int nAll = bar_index - barStart + 1
+        // ───────── TESTY A i C ─────────
+        if showAC
+            f_c(tA, 0, 0, "Testy A i C · " + syminfo.ticker + " · kapitał 10 000 $ · prowizja " + str.tostring(comm * 100) + "%", C_TXT, C_HEAD)
+            table.merge_cells(tA, 0, 0, 10, 0)
+            f_c(tA, 0, 1, "", C_MUT, C_HEAD)
+            f_c(tA, 1, 1, PN.get(0), C_TXT, C_HEAD)
+            table.merge_cells(tA, 1, 1, 6, 1)
+            f_c(tA, 7, 1, PN.get(1), C_TXT, C_HEAD)
+            table.merge_cells(tA, 7, 1, 8, 1)
+            f_c(tA, 9, 1, PN.get(2), C_TXT, C_HEAD)
+            table.merge_cells(tA, 9, 1, 10, 1)
+            array<string> hd = array.from("Wariant", "Wynik", "Kup i trzymaj", "Max spadek", "Wejścia (zysk.)", "W rynku", "Rocznie w rynku", "Wynik", "Kup i trzymaj", "Wynik", "Kup i trzymaj")
+            for c = 0 to 10
+                f_c(tA, c, 2, hd.get(c), C_MUT, C_HEAD)
+
+            float rb0 = f_ret(simsA.get(10))
+            float rb1 = snapA.get(10)
+            float rb2 = f_ret(simsA.get(21))
+            float annB = nAll > 20 ? (math.pow(1 + rb0 / 100, 252.0 / nAll) - 1) * 100 : na
+            for k = 0 to 9
+                int    row  = 3 + k
+                string name = k < 9 ? "A · " + SN.get(int(math.floor(k / 3))) + " · " + str.tostring(NS.get(k % 3)) + " ses." : "C · sprzedaj w euforii"
+                f_c(tA, 0, row, name, C_TXT, k == 9 ? C_HEAD : C_BG)
+                Sim   s   = simsA.get(k)
+                float r   = f_ret(s)
+                int   inB = s.barsIn + (s.sh > 0 ? bar_index - s.entryBar : 0)
+                f_c(tA, 1, row, f_pct(r), r > rb0 ? C_POS : C_TXT, r > rb0 ? C_BEST : C_BG)
+                f_c(tA, 2, row, f_pct(rb0), C_MUT, C_BG)
+                f_c(tA, 3, row, "-" + str.tostring(s.dd, "0.0") + "%", C_TXT, C_BG)
+                f_c(tA, 4, row, str.tostring(s.trades) + (k < 9 ? " (" + str.tostring(s.wins) + "/" + str.tostring(s.closed) + ")" : ""), C_TXT, C_BG)
+                f_c(tA, 5, row, str.tostring(100.0 * inB / nAll, "0") + "%", C_TXT, C_BG)
+                float ann = inB > 20 ? (math.pow(1 + r / 100, 252.0 / inB) - 1) * 100 : na
+                f_c(tA, 6, row, f_pct(ann), not na(ann) and ann > annB + 1 ? C_POS : C_TXT, not na(ann) and ann > annB + 1 ? C_BEST : C_BG)
+                float r1 = snapA.get(k)
+                f_c(tA, 7, row, f_pct(r1), not na(r1) and r1 > rb1 ? C_POS : C_TXT, not na(r1) and r1 > rb1 ? C_BEST : C_BG)
+                f_c(tA, 8, row, f_pct(rb1), C_MUT, C_BG)
+                float r2 = snapped ? f_ret(simsA.get(11 + k)) : na
+                f_c(tA, 9, row, f_pct(r2), not na(r2) and r2 > rb2 ? C_POS : C_TXT, not na(r2) and r2 > rb2 ? C_BEST : C_BG)
+                f_c(tA, 10, row, f_pct(snapped ? rb2 : na), C_MUT, C_BG)
+
+            Sim bh0 = simsA.get(10)
+            f_c(tA, 0, 13, "Kup i trzymaj (odniesienie)", C_MUT, C_HEAD)
+            f_c(tA, 1, 13, f_pct(rb0), C_MUT, C_HEAD)
+            f_c(tA, 2, 13, "", C_MUT, C_HEAD)
+            f_c(tA, 3, 13, "-" + str.tostring(bh0.dd, "0.0") + "%", C_MUT, C_HEAD)
+            f_c(tA, 4, 13, "", C_MUT, C_HEAD)
+            f_c(tA, 5, 13, "100%", C_MUT, C_HEAD)
+            f_c(tA, 6, 13, f_pct(annB), C_MUT, C_HEAD)
+            f_c(tA, 7, 13, f_pct(rb1), C_MUT, C_HEAD)
+            f_c(tA, 8, 13, "", C_MUT, C_HEAD)
+            f_c(tA, 9, 13, f_pct(snapped ? rb2 : na), C_MUT, C_HEAD)
+            f_c(tA, 10, 13, "", C_MUT, C_HEAD)
+            f_c(tA, 0, 14, "Żółte = lepiej niż kup i trzymaj (w „Rocznie w rynku” o ponad 1 pkt proc.). „Rocznie w rynku” = średni zwrot roczny tylko za czas trzymania akcji.", C_MUT, C_HEAD)
+            table.merge_cells(tA, 0, 14, 10, 14)
+            f_c(tA, 0, 15, "Zlecenia na otwarciu następnej sesji · utrzymanie reżimu " + str.tostring(holdB) + " ses. · wejścia (zysk.) = zyskowne / zamknięte", C_MUT, C_HEAD)
+            table.merge_cells(tA, 0, 15, 10, 15)
+
+        // ───────── TEST B ─────────
+        if showB
+            f_c(tB, 0, 0, "Test B · DCA " + f_usd(monthly) + "/mies. vs DCA + rezerwa na panikę · " + syminfo.ticker, C_TXT, C_HEAD)
+            table.merge_cells(tB, 0, 0, 9, 0)
+            f_c(tB, 0, 1, "", C_MUT, C_HEAD)
+            array<float> paidP = array.from(simsB.get(0).paid, snapPd, snapped ? simsB.get(7).paid : na)
+            for p = 0 to 2
+                f_c(tB, 1 + p * 3, 1, PN.get(p) + " · wpłacono " + f_usd(paidP.get(p)), C_TXT, C_HEAD)
+                table.merge_cells(tB, 1 + p * 3, 1, 3 + p * 3, 1)
+            f_c(tB, 0, 2, "Wariant", C_MUT, C_HEAD)
+            for p = 0 to 2
+                f_c(tB, 1 + p * 3, 2, "Wartość", C_MUT, C_HEAD)
+                f_c(tB, 2 + p * 3, 2, "vs DCA", C_MUT, C_HEAD)
+                f_c(tB, 3 + p * 3, 2, "Max spadek", C_MUT, C_HEAD)
+            for k = 0 to 6
+                int    row  = 3 + k
+                string name = k == 0 ? "Zwykłe DCA (rezerwa 0%)" : "Rezerwa " + str.tostring(RES.get(k) * 100, "0") + "% · transza " + str.tostring(TRS.get(k) * 100, "0") + "%"
+                f_c(tB, 0, row, name, C_TXT, k == 0 ? C_HEAD : C_BG)
+                for p = 0 to 2
+                    float v  = p == 0 ? f_valB(simsB.get(k))  : p == 1 ? snapBv.get(k) : snapped ? f_valB(simsB.get(7 + k)) : na
+                    float vd = p == 0 ? f_valB(simsB.get(0))  : p == 1 ? snapBv.get(0) : snapped ? f_valB(simsB.get(7)) : na
+                    float dd = p == 0 ? simsB.get(k).dd       : p == 1 ? snapBd.get(k) : snapped ? simsB.get(7 + k).dd : na
+                    float dif = not na(v) and not na(vd) and vd > 0 ? (v / vd - 1) * 100 : na
+                    bool  up  = not na(dif) and dif > 0
+                    f_c(tB, 1 + p * 3, row, f_usd(v), C_TXT, C_BG)
+                    f_c(tB, 2 + p * 3, row, k == 0 ? "—" : f_pct(dif), k == 0 ? C_MUT : up ? C_POS : C_NEG, k > 0 and up ? C_BEST : C_BG)
+                    f_c(tB, 3 + p * 3, row, na(dd) ? "—" : "-" + str.tostring(dd, "0.0") + "%", C_TXT, C_BG)
+            f_c(tB, 0, 10, "Rezerwa czeka w gotówce (0% odsetek) i jest wydawana w transzach co " + str.tostring(trEvery) + " sesji, dopóki trwa EXTREME FEAR. Spadek portfela łagodzą wpłaty.", C_MUT, C_HEAD)
+            table.merge_cells(tB, 0, 10, 9, 10)
+            f_c(tB, 0, 11, "Liczba transz (rezerwa 20% · transza 33%, cały okres): " + str.tostring(simsB.get(3).nTr), C_MUT, C_HEAD)
+            table.merge_cells(tB, 0, 11, 9, 11)
